@@ -11,6 +11,7 @@ mod app;
 
 mod airplay;
 mod audio;
+mod calib;
 mod config;
 mod controller;
 mod crypto;
