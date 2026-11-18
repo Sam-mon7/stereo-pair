@@ -377,6 +377,17 @@ fn mean(v: &[f64]) -> f64 {
     v.iter().sum::<f64>() / v.len().max(1) as f64
 }
 
+/// Median: robust to one wobbly repeat (AirPlay NTP-timed playout jitters by ~1 ms).
+fn median(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    let m = s.len() / 2;
+    if s.len() % 2 == 1 { s[m] } else { 0.5 * (s[m - 1] + s[m]) }
+}
+
 pub fn analyze(rec: &Recording, sched: &Schedule, names: &[String]) -> Result<Analysis> {
     ensure!(!rec.channels.is_empty() && rec.rate >= 16000.0, "no usable recording");
     ensure!(sched.speakers >= 1 && sched.repeats >= 1 && names.len() == sched.speakers, "bad schedule");
@@ -515,7 +526,7 @@ pub fn analyze(rec: &Recording, sched: &Schedule, names: &[String]) -> Result<An
         let srms = mean(&ks.iter().map(|&k| sweep_rms[k]).collect::<Vec<_>>());
         speakers.push(SpeakerResult {
             name: names[spk].clone(),
-            arrival_ms: mean(&arrivals[spk]),
+            arrival_ms: median(&arrivals[spk]),
             arrival_spread_ms: spread(&arrivals[spk]),
             repeat_arrivals_ms: arrivals[spk].clone(),
             level_db,
@@ -559,17 +570,20 @@ pub fn quality(a: &Analysis) -> Vec<Issue> {
     if a.clock_ppm.abs() > 1000.0 {
         fatal(format!("Mic clock off by {:.0} ppm: wrong sample rate or dropouts.", a.clock_ppm));
     }
-    if a.drift_residual_ms > 0.2 {
+    // Tolerances reflect real hardware: AirPlay's NTP-timed playout wobbles by
+    // ~1 ms between sweeps on some receivers (measured 1.2-3.4 ms on a Home View),
+    // so only refuse clearly broken runs and use the median of the repeats.
+    if a.drift_residual_ms > 1.5 {
         fatal(format!("Timing jumped by {:.2} ms between sweeps: the recording had dropouts or a speaker re-synced. Try again.", a.drift_residual_ms));
     }
     for s in &a.speakers {
         if s.pnr_db < 20.0 {
             fatal(format!("{}: sweep barely detectable at the mic (IR peak-to-noise {:.0} dB). Raise the sweep level or mic gain, or reduce noise.", s.name, s.pnr_db));
         }
-        if s.arrival_spread_ms > 0.25 {
+        if s.arrival_spread_ms > 2.5 {
             fatal(format!("{}: arrival time varied by {:.2} ms between repeats.", s.name, s.arrival_spread_ms));
         }
-        if s.level_spread_db > 1.0 {
+        if s.level_spread_db > 3.0 {
             fatal(format!("{}: level varied by {:.1} dB between repeats (noise or something moved?).", s.name, s.level_spread_db));
         }
         if s.arrival_ms.abs() > 200.0 {
@@ -577,6 +591,9 @@ pub fn quality(a: &Analysis) -> Vec<Issue> {
         }
     }
     let mut warn = |t: String| v.push(Issue { fatal: false, text: t });
+    if (0.3..=1.5).contains(&a.drift_residual_ms) {
+        warn(format!("Speaker timing wobbled by {:.2} ms during the measurement (normal for AirPlay's clock mode); the median is used.", a.drift_residual_ms));
+    }
     for s in &a.speakers {
         if s.pnr_db >= 20.0 && s.pnr_db < 35.0 {
             warn(format!("{}: low signal-to-noise (IR peak-to-noise {:.0} dB); results may be rough.", s.name, s.pnr_db));
@@ -584,10 +601,10 @@ pub fn quality(a: &Analysis) -> Vec<Issue> {
         if s.sweep_dbfs < -55.0 {
             warn(format!("{}: quiet at the mic ({:.0} dBFS RMS); more mic gain would help.", s.name, s.sweep_dbfs));
         }
-        if (0.1..=0.25).contains(&s.arrival_spread_ms) {
-            warn(format!("{}: arrival time varied by {:.2} ms between repeats.", s.name, s.arrival_spread_ms));
+        if (0.5..=2.5).contains(&s.arrival_spread_ms) {
+            warn(format!("{}: arrival time varied by {:.2} ms between repeats (median used).", s.name, s.arrival_spread_ms));
         }
-        if (0.5..=1.0).contains(&s.level_spread_db) {
+        if (1.0..=3.0).contains(&s.level_spread_db) {
             warn(format!("{}: level varied by {:.1} dB between repeats.", s.name, s.level_spread_db));
         }
         if s.response_spread_db > 2.0 {

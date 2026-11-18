@@ -60,7 +60,7 @@ pub struct CalibrationRequest {
 }
 
 pub const DEFAULT_LEVEL_DBFS: f64 = -20.0;
-pub const DEFAULT_REPEATS: usize = 3;
+pub const DEFAULT_REPEATS: usize = 5;
 pub const DEFAULT_SWEEP_SECONDS: f64 = 3.0;
 pub const DEFAULT_GAP_SECONDS: f64 = 1.5;
 pub const DEFAULT_LEAD_SECONDS: f64 = 2.0;

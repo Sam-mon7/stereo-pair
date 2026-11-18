@@ -274,7 +274,7 @@ impl CalibUi {
             ui.add(egui::Slider::new(&mut self.level_dbfs, -40.0..=-6.0).suffix(" dBFS").step_by(1.0));
             ui.end_row();
             ui.label("Sweeps");
-            ui.add(egui::Slider::new(&mut self.repeats, 1..=4).suffix(" per speaker"));
+            ui.add(egui::Slider::new(&mut self.repeats, 1..=8).suffix(" per speaker"));
             ui.end_row();
         });
         let diff = self.level_dbfs - music_db;
