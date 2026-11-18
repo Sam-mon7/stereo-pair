@@ -32,6 +32,9 @@ pub struct CalibUi {
     rms: [f32; 2],
     peak_hold: [(f32, Instant); 2],
     clip_at: Option<Instant>,
+    /// Last time either input was above the noise floor (drives the "no signal" hint).
+    last_signal: Instant,
+    last_poll: Instant,
     message: Option<(Color32, String)>,
     saved_dir: Option<PathBuf>,
 }
@@ -49,6 +52,8 @@ impl Default for CalibUi {
             rms: [-150.0; 2],
             peak_hold: [(-150.0, Instant::now()); 2],
             clip_at: None,
+            last_signal: Instant::now(),
+            last_poll: Instant::now(),
             message: None,
             saved_dir: None,
         }
@@ -92,8 +97,19 @@ impl CalibUi {
         let Some(m) = &self.mic else { return };
         let l = m.take_levels();
         let now = Instant::now();
+        if l.frames == 0 {
+            // No new audio since the last frame: keep the previous reading (a fresh
+            // take would read as silence and make the meter and warnings flicker).
+            return;
+        }
+        let quiet = l.rms_dbfs[0].max(l.rms_dbfs[1]) < -80.0;
+        if !quiet {
+            self.last_signal = now;
+        }
         for c in 0..2 {
-            self.rms[c] = l.rms_dbfs[c];
+            // fast attack, ~20 dB/s release so the bar doesn't jump between frames
+            let fallen = self.rms[c] - 20.0 * now.duration_since(self.last_poll).as_secs_f32();
+            self.rms[c] = l.rms_dbfs[c].max(fallen);
             let (p, t) = self.peak_hold[c];
             if l.peak_dbfs[c] >= p || now.duration_since(t) > Duration::from_millis(1500) {
                 self.peak_hold[c] = (l.peak_dbfs[c], now);
@@ -102,6 +118,7 @@ impl CalibUi {
                 self.clip_at = Some(now);
             }
         }
+        self.last_poll = now;
     }
 
     /// The input that carries the mic (the louder one).
@@ -143,7 +160,7 @@ impl CalibUi {
     fn mic_warnings(&self, ui: &mut Ui) {
         if self.clip_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) {
             ui.colored_label(BAD, "Clipping! Turn the input gain on the Focusrite down.");
-        } else if self.rms[0].max(self.rms[1]) < -80.0 && self.mic.is_some() {
+        } else if self.mic.is_some() && self.last_signal.elapsed() > Duration::from_secs(1) {
             ui.colored_label(WARN, "No signal on either input: check the mic cable, 48V phantom power and the gain knob.");
         }
     }

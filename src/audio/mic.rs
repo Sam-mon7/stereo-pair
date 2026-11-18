@@ -45,6 +45,8 @@ pub struct MicLevels {
     /// Peak and RMS since the previous call (dBFS; -inf-ish at -150 when silent).
     pub peak_dbfs: [f32; 2],
     pub rms_dbfs: [f32; 2],
+    /// Frames measured since the previous call (0 = no new audio; levels are meaningless).
+    pub frames: u64,
 }
 
 #[derive(Default)]
@@ -201,6 +203,7 @@ impl Mic {
             channels: s.channels,
             peak_dbfs: [db(m.peak[0] as f64), db(m.peak[1] as f64)],
             rms_dbfs: [db((m.sumsq[0] / n).sqrt()), db((m.sumsq[1] / n).sqrt())],
+            frames: m.n,
         }
     }
 
