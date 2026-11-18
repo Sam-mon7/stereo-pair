@@ -3,6 +3,7 @@
 //! nothing it returns silence so the stream keeps flowing.
 
 pub mod capture;
+pub mod mic;
 pub mod resample;
 pub mod tone;
 pub mod volume;

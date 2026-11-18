@@ -12,11 +12,12 @@
 //! * changing latency (or the fixed device volume / timing port) restarts the stream;
 //! * settings are persisted to config.toml after a short debounce.
 //!
-//! Extension point (not implemented yet): the calibration routine would be another
-//! supervisor command next to [`Controller::test_tone`]: for each speaker in turn,
-//! play a log sweep through its [`LiveDsp::play_overlay`] while recording the
-//! measurement mic (a capture-device input, see [`crate::audio::open_loopback`]),
-//! then derive per-speaker delay/gain (and later EQ) and apply them via `update`.
+//! * pair-wide spatial settings apply immediately through one shared
+//!   [`LiveSpatial`] (kept across engine restarts);
+//! * [`Controller::calibrate`] runs an acoustic calibration on the running stream
+//!   ([`crate::calib::job`]): sweeps scheduled on the timeline per speaker, the mic
+//!   recorded, analysed on a worker thread; the result is published as
+//!   [`CalibrationState::Done`] and applied by the caller (the panel) through `update`.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -34,6 +35,7 @@ use crate::airplay::discovery;
 use crate::audio::tone::ToneSource;
 use crate::audio::volume::VolumeFollower;
 use crate::audio::{InputHandle, Source};
+use crate::calib::job::{CalibrationRequest, CalibrationState, Job, Target};
 use crate::config::{Config, CredentialStore, SpeakerConfig};
 use crate::dsp::LiveDsp;
 use crate::dsp::spatial::LiveSpatial;
@@ -193,6 +195,8 @@ enum Cmd {
     Stop,
     Update(Box<Config>),
     Test(String),
+    Calibrate(Box<CalibrationRequest>),
+    CancelCalibration,
     Shutdown,
 }
 
@@ -204,6 +208,7 @@ struct Shared {
     live: Mutex<HashMap<String, Arc<LiveDsp>>>,
     /// Pair-wide spatial settings, kept across engine restarts.
     spatial: Arc<LiveSpatial>,
+    calibration: Mutex<CalibrationState>,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -230,6 +235,7 @@ impl Controller {
             config: Mutex::new(cfg.clone()),
             live: Mutex::new(HashMap::new()),
             spatial: LiveSpatial::new(cfg.spatial.clone()),
+            calibration: Mutex::new(CalibrationState::Idle),
             waker: Mutex::new(None),
         });
         for s in &cfg.speakers {
@@ -253,6 +259,7 @@ impl Controller {
             next_start: Instant::now(),
             speaker_errors: HashMap::new(),
             test: None,
+            cal: None,
             save_due: None,
         };
         sup.publish();
@@ -299,7 +306,31 @@ impl Controller {
         self.shared.status.lock().unwrap().clone()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))] // inspection hook (tests, future calibration)
+    /// Start an acoustic calibration (stream must be running with every enabled
+    /// speaker streaming). Progress and the result appear in [`Controller::calibration`].
+    pub fn calibrate(&self, req: CalibrationRequest) {
+        *self.shared.calibration.lock().unwrap() = CalibrationState::Measuring { progress: 0.0, detail: "Starting...".into(), first_frame: 0 };
+        let _ = self.tx.send(Cmd::Calibrate(Box::new(req)));
+    }
+
+    /// Abort a running calibration (probes fade out, programme unmutes).
+    pub fn cancel_calibration(&self) {
+        let _ = self.tx.send(Cmd::CancelCalibration);
+    }
+
+    pub fn calibration(&self) -> CalibrationState {
+        self.shared.calibration.lock().unwrap().clone()
+    }
+
+    /// Forget a finished (done / failed) calibration.
+    pub fn dismiss_calibration(&self) {
+        let mut c = self.shared.calibration.lock().unwrap();
+        if !c.busy() {
+            *c = CalibrationState::Idle;
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))] // inspection hook (tests)
     pub fn live_dsp(&self, key: &str) -> Option<Arc<LiveDsp>> {
         self.shared.live.lock().unwrap().get(key).cloned()
     }
@@ -357,6 +388,7 @@ struct Supervisor {
     /// Per-speaker problems outside the engine (resolve / credentials / test).
     speaker_errors: HashMap<String, String>,
     test: Option<TestRun>,
+    cal: Option<Job>,
     save_due: Option<Instant>,
 }
 
@@ -383,6 +415,7 @@ impl Supervisor {
                 self.try_start();
             }
             self.reap_test();
+            self.tick_calibration();
             if self.save_due.is_some_and(|t| Instant::now() >= t) {
                 self.flush_save();
             }
@@ -416,6 +449,13 @@ impl Supervisor {
             }
             Cmd::Update(cfg) => self.apply_update(*cfg),
             Cmd::Test(key) => self.test_tone(&key),
+            Cmd::Calibrate(req) => self.start_calibration(*req),
+            Cmd::CancelCalibration => {
+                if let Some(mut job) = self.cal.take() {
+                    let st = job.abort(self.running.as_ref().map(|r| &r.engine), "Cancelled.");
+                    self.set_calibration(st);
+                }
+            }
             Cmd::Shutdown => {}
         }
     }
@@ -501,6 +541,10 @@ impl Supervisor {
     }
 
     fn stop_engine(&mut self) {
+        if let Some(mut job) = self.cal.take() {
+            let st = job.abort(self.running.as_ref().map(|r| &r.engine), "Streaming stopped during the calibration.");
+            self.set_calibration(st);
+        }
         if let Some(mut r) = self.running.take() {
             r.engine.shutdown();
             drop(r.input);
@@ -558,8 +602,66 @@ impl Supervisor {
         }
     }
 
+    fn set_calibration(&self, st: CalibrationState) {
+        *self.shared.calibration.lock().unwrap() = st;
+        if let Some(w) = self.shared.waker.lock().unwrap().as_ref() {
+            w();
+        }
+    }
+
+    fn start_calibration(&mut self, req: CalibrationRequest) {
+        if self.cal.is_some() {
+            return;
+        }
+        let res = (|| -> Result<(Job, CalibrationState)> {
+            let r = self.running.as_ref().ok_or_else(|| anyhow!("Start streaming first: the calibration plays through the running stream."))?;
+            let slots = r.engine.status();
+            let mut targets = Vec::new();
+            for s in self.cfg.speakers.iter().filter(|s| s.enabled) {
+                let key = s.key();
+                let slot = r.ids.get(&key).and_then(|id| slots.iter().find(|x| x.id == *id));
+                match slot {
+                    Some(st) if st.state == SlotState::Streaming => targets.push(Target {
+                        key: key.clone(),
+                        name: s.name.clone(),
+                        slot: st.id,
+                        live: self.shared.live_for(s),
+                    }),
+                    _ => return Err(anyhow!("{} is not streaming yet; wait until every enabled speaker is connected.", s.name)),
+                }
+            }
+            Job::start(req, targets, &r.engine)
+        })();
+        match res {
+            Ok((job, st)) => {
+                self.cal = Some(job);
+                self.set_calibration(st);
+            }
+            Err(e) => {
+                warn!("calibration not started: {e:#}");
+                self.set_calibration(CalibrationState::Failed(format!("{e:#}")));
+            }
+        }
+    }
+
+    fn tick_calibration(&mut self) {
+        let Some(job) = self.cal.as_mut() else { return };
+        let engine = self.running.as_ref().map(|r| &r.engine);
+        let slots = engine.map(|e| e.status()).unwrap_or_default();
+        let streaming = |id: SlotId| slots.iter().any(|s| s.id == id && s.state == SlotState::Streaming);
+        let (st, finished) = job.tick(engine, streaming);
+        if finished {
+            self.cal = None;
+        }
+        self.set_calibration(st);
+    }
+
     fn test_tone(&mut self, key: &str) {
         let Some(s) = self.cfg.speakers.iter().find(|s| s.key() == key).cloned() else { return };
+        if self.cal.as_ref().is_some_and(|j| j.measuring()) {
+            self.speaker_errors.insert(key.into(), "test: not while calibrating".into());
+            return;
+        }
         if let Some(r) = &self.running
             && let Some(&id) = r.ids.get(key)
         {

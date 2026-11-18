@@ -125,6 +125,14 @@ enum Cmd {
         #[arg(long, default_value_t = 3.0)]
         seconds: f64,
     },
+    /// List capture devices and print the calibration mic's per-input levels (nothing recorded)
+    MicTest {
+        /// Part of the device name (default: "Analogue 1 + 2", else the default input)
+        #[arg(long)]
+        device: Option<String>,
+        #[arg(long, default_value_t = 3.0)]
+        seconds: f64,
+    },
 }
 
 fn init_logging(verbose: u8) {
@@ -215,6 +223,7 @@ fn real_main(cli: Cli) -> Result<()> {
         Cmd::Tone { ips, seconds, amplitude, latency_ms, split } => cmd_tone(ips, seconds, amplitude, latency_ms, split),
         Cmd::Run { latency_ms } => cmd_run(latency_ms),
         Cmd::CaptureTest { seconds } => cmd_capture_test(seconds),
+        Cmd::MicTest { device, seconds } => audio::mic::mic_test(device.as_deref(), seconds),
         Cmd::Config => {
             let (cfg, path, created) = Config::load_or_create()?;
             println!("config:      {}{}", path.display(), if created { " (created with defaults)" } else { "" });

@@ -23,6 +23,7 @@
 pub mod analysis;
 pub mod fft;
 pub mod fit;
+pub mod job;
 pub mod report;
 #[cfg(test)]
 mod sim;

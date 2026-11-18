@@ -238,10 +238,14 @@ fn serve(stream: &mut TcpStream, accessory: &SigningKey, client_ltpk: [u8; 32], 
                                 break;
                             }
                         }
-                        // keep the channel open until the client goes away
-                        while let Ok(n) = es.read(&mut c) {
-                            if n == 0 {
-                                break;
+                        // keep the channel open until the client goes away (read
+                        // timeouts just mean the client is quiet)
+                        loop {
+                            match es.read(&mut c) {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                                Err(_) => break,
                             }
                         }
                     }));
@@ -482,4 +486,215 @@ fn two_fake_receivers_share_one_timeline() {
     assert!(a_peak > 1000, "left speaker should hear first note ({a_peak})");
     assert_eq!(b_peak, 0, "right speaker silent during first note");
     assert_ne!(a.shk, b.shk, "each speaker has its own key");
+}
+
+fn hap_creds(port_keys: &std::collections::HashMap<u16, [u8; 32]>, port: u16, client_seed: &[u8; 32]) -> Credentials {
+    Credentials::Hap(HapCredentials {
+        ltpk: port_keys[&port].to_vec(),
+        ltsk: client_seed.to_vec(),
+        atv_id: ACCESSORY_ID.to_vec(),
+        client_id: CLIENT_ID.to_vec(),
+        apple_device_id: "0x0123456789AB".into(),
+        client_name: "Stereo Pair".into(),
+    })
+}
+
+/// Timeline frame -> stereo sample, from everything a receiver decrypted.
+fn received_frames(o: &Mutex<Observed>, latency: u32) -> std::collections::BTreeMap<u64, [i16; 2]> {
+    let o = o.lock().unwrap();
+    let mut m = std::collections::BTreeMap::new();
+    for (_, rtp, _, pcm) in &o.audio {
+        let f0 = rtp.wrapping_sub(latency) as u64;
+        for (i, c) in pcm.chunks(4).enumerate() {
+            m.insert(f0 + i as u64, [i16::from_be_bytes([c[0], c[1]]), i16::from_be_bytes([c[2], c[3]])]);
+        }
+    }
+    m
+}
+
+#[test]
+fn probes_land_on_their_exact_timeline_frames() {
+    use crate::dsp::f32_to_i16;
+    use crate::engine::Engine;
+    let client_seed = rand_bytes();
+    let client_ltpk = SigningKey::from_bytes(&client_seed).verifying_key().to_bytes();
+    let rx: Vec<FakeReceiver> = (0..2).map(|_| FakeReceiver::start(client_ltpk)).collect();
+    let keys: std::collections::HashMap<u16, [u8; 32]> = rx.iter().map(|r| (r.port, r.accessory_pub)).collect();
+    let plans: Vec<SpeakerPlan> = rx
+        .iter()
+        .zip([ChannelSource::Left, ChannelSource::Right])
+        .enumerate()
+        .map(|(i, (r, role))| {
+            let creds = hap_creds(&keys, r.port, &client_seed);
+            // probes bypass the speaker's delay, trim and EQ
+            let dsp = DspSettings { source: role, delay_ms: 7.0 * i as f32, gain_db: -6.0, ..Default::default() };
+            let mut p = SpeakerPlan::new(&format!("fake{i}"), IpAddr::V4(Ipv4Addr::LOCALHOST), creds, dsp);
+            p.port = r.port;
+            p
+        })
+        .collect();
+    let lives: Vec<_> = plans.iter().map(|p| p.live.clone()).collect();
+    let latency = 13230;
+    let opts = EngineOptions {
+        latency_frames: latency,
+        device_volume_db: None,
+        timing_port: 0,
+        reconnect: false,
+        run_for: None,
+        gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        spatial: Default::default(),
+    };
+    let (mut engine, _) = Engine::start(plans, Box::new(ConstSource), opts).unwrap();
+    engine.set_programme_mute(true);
+    // a distinctive probe: 1000 samples of a ramp, scheduled ~0.4 s ahead, with odd
+    // offsets so it straddles packet boundaries
+    let probe: Arc<Vec<f32>> = Arc::new((0..1000).map(|k| (k as f32 - 500.0) / 1000.0).collect());
+    let at = engine.timeline().next_packet() * 352 + 17_777;
+    lives[0].schedule_probe(at, probe.clone());
+    lives[1].schedule_probe(at + 4_321, probe.clone());
+    wait_until("probes played", || engine.timeline().next_packet() * 352 > at + 4_321 + 2000 && !lives[1].probes_pending());
+    std::thread::sleep(Duration::from_millis(100));
+    engine.shutdown();
+    for (r, start) in rx.iter().zip([at, at + 4_321]) {
+        let got = received_frames(&r.observed, latency);
+        for f in start - 400..start + 1400 {
+            let want = if (start..start + 1000).contains(&f) { f32_to_i16(probe[(f - start) as usize]) } else { 0 };
+            assert_eq!(got.get(&f).copied(), Some([want, want]), "frame {f} (probe at {start})");
+        }
+    }
+}
+
+/// Test mic: on stop, "records" the room: both receivers' decrypted output summed
+/// with known integer delays and gains, plus noise, from an arbitrary start.
+struct RoomMic {
+    rx: Vec<Arc<Mutex<Observed>>>,
+    latency: u32,
+    delays: [usize; 2],
+    gains: [f32; 2],
+}
+
+impl crate::calib::job::MicInput for RoomMic {
+    fn start_recording(&self) {}
+    fn stop_recording(&self) -> anyhow::Result<crate::calib::Recording> {
+        let frames: Vec<_> = self.rx.iter().map(|o| received_frames(o, self.latency)).collect();
+        let first = frames.iter().map(|m| *m.keys().next().unwrap()).max().unwrap();
+        let last = frames.iter().map(|m| *m.keys().next_back().unwrap()).min().unwrap();
+        let len = (last - first) as usize + 1234;
+        let mut mic = vec![0.0f32; len];
+        for ((m, d), g) in frames.iter().zip(self.delays).zip(self.gains) {
+            for (f, s) in m.range(first..=last) {
+                let i = (f - first) as usize + d + 1234; // arbitrary recording start
+                if i < len {
+                    mic[i] += g * s[0] as f32 / 32767.0;
+                }
+            }
+        }
+        let mut seed = 7u32;
+        for v in mic.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v += ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 1e-4;
+        }
+        Ok(crate::calib::Recording { rate: 44100.0, channels: vec![vec![0.0; len], mic] })
+    }
+    fn error(&self) -> Option<String> {
+        None
+    }
+}
+
+#[test]
+fn controller_calibration_end_to_end_through_fake_receivers() {
+    use crate::calib::job::{CalibrationRequest, CalibrationState};
+    use crate::config::{Config, SpeakerConfig};
+    use crate::controller::{Controller, ControllerDeps, SpeakerState};
+
+    let client_seed = rand_bytes();
+    let client_ltpk = SigningKey::from_bytes(&client_seed).verifying_key().to_bytes();
+    let rx: Vec<FakeReceiver> = (0..2).map(|_| FakeReceiver::start(client_ltpk)).collect();
+    let keys: std::collections::HashMap<u16, [u8; 32]> = rx.iter().map(|r| (r.port, r.accessory_pub)).collect();
+    let mut cfg = Config { latency_ms: 300, auto_start: false, ..Config::default() };
+    cfg.speakers = rx
+        .iter()
+        .zip([("fakeL", ChannelSource::Left), ("fakeR", ChannelSource::Right)])
+        .map(|(r, (name, role))| SpeakerConfig { port: Some(r.port), ..SpeakerConfig::new(name, "127.0.0.1", role) })
+        .collect();
+    let deps = ControllerDeps {
+        open_input: Box::new(|| {
+            Ok((Box::new(ConstSource) as Box<dyn crate::audio::Source>, crate::audio::InputHandle::new(|| "const".into(), ())))
+        }),
+        credentials: Box::new(move |s, _ip| Ok(hap_creds(&keys, s.port.unwrap(), &client_seed))),
+        config_path: None,
+        volume: None,
+        save_debounce: Duration::from_millis(100),
+    };
+    let mut ctrl = Controller::new(cfg.clone(), deps).unwrap();
+    let mic = Arc::new(RoomMic {
+        rx: rx.iter().map(|r| r.observed.clone()).collect(),
+        latency: 13230,
+        // right speaker reaches the mic 163 samples (3.696 ms) later, 2.5 dB quieter
+        delays: [60, 223],
+        gains: [1.0, 10f32.powf(-2.5 / 20.0)],
+    });
+    let request = |mic: Arc<RoomMic>| {
+        let mut r = CalibrationRequest::new(mic, -12.0, 2);
+        r.sweep_seconds = 0.8;
+        r.gap_seconds = 0.4;
+        r.lead_seconds = 1.0;
+        r
+    };
+
+    // not streaming: refused
+    ctrl.calibrate(request(mic.clone()));
+    wait_until("refused", || matches!(ctrl.calibration(), CalibrationState::Failed(e) if e.contains("Start streaming")));
+
+    ctrl.start();
+    wait_until("both speakers streaming", || ctrl.status().speakers.iter().all(|s| s.state == SpeakerState::Streaming && s.packets > 20));
+    ctrl.calibrate(request(mic.clone()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    let mut first_frame = 0;
+    let result = loop {
+        match ctrl.calibration() {
+            CalibrationState::Done(r) => break r,
+            CalibrationState::Failed(e) => panic!("calibration failed: {e}"),
+            CalibrationState::Measuring { first_frame: f, .. } if f > 0 => first_frame = f,
+            _ => {}
+        }
+        assert!(std::time::Instant::now() < deadline, "calibration timed out: {:?}", ctrl.calibration());
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(result.first_frame, first_frame);
+    let a = &result.analysis;
+    assert_eq!(a.mic_channel, 1);
+    let d = a.speakers[1].arrival_ms;
+    assert!((d - 163.0 / 44.1).abs() < 0.1, "delay {d} ms, issues {:?}", a.issues);
+    let l = a.speakers[1].level_db - a.speakers[0].level_db;
+    assert!((l + 2.5).abs() < 0.3, "level {l} dB");
+    assert!(a.clock_ppm.abs() < 5.0, "same clock: {} ppm", a.clock_ppm);
+    assert!(a.ok(), "{:?}", a.issues);
+    let p = &result.proposal;
+    assert!((p.speakers[0].delay_ms - 3.70).abs() < 0.1 && p.speakers[1].delay_ms == 0.0);
+    assert!((p.speakers[0].gain_db + 2.5).abs() < 0.3 && p.speakers[1].gain_db == 0.0);
+    assert!(p.speakers.iter().all(|s| s.bands.is_empty()), "digital path is flat: {:?}", p.speakers.iter().map(|s| &s.bands).collect::<Vec<_>>());
+
+    // the programme was muted before the first sweep, and the sweeps landed exactly
+    // where scheduled: speaker 0 at first_frame, speaker 1 one period later
+    let got0 = received_frames(&rx[0].observed, 13230);
+    let got1 = received_frames(&rx[1].observed, 13230);
+    let sweep: Vec<i16> = result.schedule.sweep.render(44100.0).iter().map(|&v| crate::dsp::f32_to_i16(v as f32)).collect();
+    let period = result.schedule.period_frames;
+    for f in first_frame - 20_000..first_frame {
+        assert_eq!(got0[&f], [0, 0], "muted before the sweep (frame {f})");
+    }
+    for (k, s) in sweep.iter().enumerate() {
+        let k = k as u64;
+        assert_eq!(got0[&(first_frame + k)], [*s, *s], "speaker 0 sweep sample {k}");
+        assert_eq!(got1[&(first_frame + k)], [0, 0], "speaker 1 silent during speaker 0's sweep");
+        assert_eq!(got1[&(first_frame + period + k)], [*s, *s], "speaker 1 sweep sample {k}");
+    }
+
+    // the programme comes back after the measurement
+    wait_until("programme unmuted", || last_samples(&rx[0].observed).iter().all(|&s| s == 8192));
+    ctrl.dismiss_calibration();
+    assert!(matches!(ctrl.calibration(), CalibrationState::Idle));
+    ctrl.stop();
+    assert!(ctrl.shutdown(Duration::from_secs(5)));
 }
