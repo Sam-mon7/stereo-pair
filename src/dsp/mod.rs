@@ -9,17 +9,25 @@
 //! crossfades the old and new delay taps over [`DELAY_XFADE_FRAMES`] (changes arriving
 //! mid-crossfade are queued, newest wins).
 //!
-//! ## Extension points (not implemented yet)
+//! ## Stages
 //!
-//! * **Per-speaker EQ** (biquad chain, e.g. room correction from the calibration
-//!   routine): add a `Vec<Biquad>` to [`SpeakerDsp`] and its parameters to
-//!   [`DspSettings`]; run it in [`SpeakerDsp::process_to_be16`] on the routed frame,
-//!   right after `route` and before the gains (marked `EQ STAGE` below). New
-//!   coefficients arrive through the same `LiveDsp` generation check.
-//! * **Spatial effects across the pair** (crossfeed, widening, mid/side): these need
-//!   both input channels before any per-speaker routing, so they belong in a pair stage
-//!   applied once to the shared input in the sender (`engine::spawn_sender`, where
-//!   `source.fill` hands frames to every sink), not here.
+//! Per packet, for each speaker: delay line -> routing -> **EQ** ([`eq::EqChain`], a
+//! biquad chain on the routed frame, before the gains so a trim or the Windows volume
+//! never changes what the EQ sees) -> trim x global gain -> + test-chime overlay ->
+//! + calibration probe -> s16.
+//!
+//! The pair-wide **spatial** stage ([`spatial::SpatialStage`]) is not here: it needs
+//! both input channels before any per-speaker routing, so the sender runs it once on
+//! the shared input (`engine::spawn_sender`).
+//!
+//! **Calibration probes** ([`LiveDsp::schedule_probe`]) are samples mixed into this
+//! speaker's output at exact timeline frame positions, after every other stage (no
+//! delay, EQ, trim or volume): the calibration routine measures the raw speaker, then
+//! proposes absolute delay / gain / EQ settings.
+
+pub mod biquad;
+pub mod eq;
+pub mod spatial;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +35,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::audio::Source;
+use eq::{EqChain, EqSettings};
 
 pub const MAX_DELAY_MS: f32 = 500.0;
 /// Ring buffer for the delay line: power of two above 500 ms at 44.1 kHz (22050 frames).
@@ -63,11 +72,12 @@ pub struct DspSettings {
     pub source: ChannelSource,
     pub gain_db: f32,
     pub delay_ms: f32,
+    pub eq: EqSettings,
 }
 
 impl Default for DspSettings {
     fn default() -> Self {
-        Self { source: ChannelSource::Stereo, gain_db: 0.0, delay_ms: 0.0 }
+        Self { source: ChannelSource::Stereo, gain_db: 0.0, delay_ms: 0.0, eq: EqSettings::default() }
     }
 }
 
@@ -94,13 +104,25 @@ fn delay_frames_for(ms: f32, sample_rate: u32) -> usize {
 /// the sender's [`SpeakerDsp`] notices the new generation at its next packet.
 ///
 /// The overlay slot mixes a short source (the "Test" chime) into this speaker only,
-/// after routing; the calibration routine's per-speaker sweeps would be played the
-/// same way (while a capture-device input records the measurement mic).
+/// after routing, from the next packet on. Probes are the calibration sweeps: mixed in
+/// raw at exact timeline frames (see [`LiveDsp::schedule_probe`]).
 pub struct LiveDsp {
     settings: Mutex<DspSettings>,
     generation: AtomicU64,
     overlay: Mutex<Option<Box<dyn Source>>>,
     overlay_active: AtomicBool,
+    probes: Mutex<Vec<Probe>>,
+    probes_active: AtomicBool,
+    probe_cancel: AtomicBool,
+}
+
+/// Samples to play on one speaker starting at timeline frame `start_frame` (frame `n`
+/// of the shared timeline is sample `n % 352` of packet `n / 352`; every speaker
+/// plays the same frame at the same moment).
+#[derive(Clone, Debug)]
+pub struct Probe {
+    pub start_frame: u64,
+    pub samples: Arc<Vec<f32>>,
 }
 
 impl std::fmt::Debug for LiveDsp {
@@ -116,6 +138,9 @@ impl LiveDsp {
             generation: AtomicU64::new(0),
             overlay: Mutex::new(None),
             overlay_active: AtomicBool::new(false),
+            probes: Mutex::new(Vec::new()),
+            probes_active: AtomicBool::new(false),
+            probe_cancel: AtomicBool::new(false),
         })
     }
 
@@ -147,6 +172,64 @@ impl LiveDsp {
 
     pub fn overlay_playing(&self) -> bool {
         self.overlay_active.load(Ordering::Acquire)
+    }
+
+    /// Play `samples` (mono, both output channels) on this speaker from timeline frame
+    /// `start_frame` on, unaffected by delay, EQ, trim and volume.
+    pub fn schedule_probe(&self, start_frame: u64, samples: Arc<Vec<f32>>) {
+        self.probes.lock().unwrap().push(Probe { start_frame, samples });
+        self.probes_active.store(true, Ordering::Release);
+    }
+
+    /// Stop all probes: one still playing fades out over the next packet.
+    pub fn cancel_probes(&self) {
+        if self.probes_active.load(Ordering::Acquire) {
+            self.probe_cancel.store(true, Ordering::Release);
+        }
+    }
+
+    /// Drop all probes at once (use only when none can be playing).
+    pub fn clear_probes(&self) {
+        self.probes.lock().unwrap().clear();
+        self.probes_active.store(false, Ordering::Release);
+        self.probe_cancel.store(false, Ordering::Release);
+    }
+
+    /// True while probes are scheduled or playing.
+    pub fn probes_pending(&self) -> bool {
+        self.probes_active.load(Ordering::Acquire)
+    }
+
+    /// Write the probe samples for frames `frame0..frame0 + out.len()` into `out`
+    /// (zeros elsewhere). Returns false (and leaves `out` alone) if there are none.
+    fn fill_probes(&self, frame0: u64, out: &mut [f32]) -> bool {
+        if !self.probes_active.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut probes = self.probes.lock().unwrap();
+        out.fill(0.0);
+        let end = frame0 + out.len() as u64;
+        for p in probes.iter() {
+            let p_end = p.start_frame + p.samples.len() as u64;
+            if p.start_frame >= end || p_end <= frame0 {
+                continue;
+            }
+            for f in p.start_frame.max(frame0)..p_end.min(end) {
+                out[(f - frame0) as usize] += p.samples[(f - p.start_frame) as usize];
+            }
+        }
+        if self.probe_cancel.swap(false, Ordering::AcqRel) {
+            let n = out.len() as f32;
+            for (i, o) in out.iter_mut().enumerate() {
+                *o *= 1.0 - (i + 1) as f32 / n;
+            }
+            probes.clear();
+        }
+        probes.retain(|p| p.start_frame + p.samples.len() as u64 > end);
+        if probes.is_empty() {
+            self.probes_active.store(false, Ordering::Release);
+        }
+        true
     }
 
     /// Fill `out` from the overlay (zeros if none); drops it once finished.
@@ -187,6 +270,12 @@ pub struct SpeakerDsp {
     pending_delay: Option<usize>,
     last_global: Option<f32>,
     overlay: Vec<[f32; 2]>,
+    eq: EqChain,
+    /// Routed frames of the current packet (the EQ runs on these in f64).
+    routed: Vec<[f64; 2]>,
+    probe: Vec<f32>,
+    /// Timeline frame of the next packet when the caller does not say (tests).
+    next_frame: u64,
 }
 
 impl SpeakerDsp {
@@ -207,6 +296,10 @@ impl SpeakerDsp {
             pending_delay: None,
             last_global: None,
             overlay: Vec::new(),
+            eq: EqChain::new(&settings.eq, sample_rate),
+            routed: Vec::new(),
+            probe: Vec::new(),
+            next_frame: 0,
         }
     }
 
@@ -235,6 +328,7 @@ impl SpeakerDsp {
         // so a dragged slider gives a chain of complete crossfades (no jumps).
         let d = delay_frames_for(s.delay_ms, self.sample_rate);
         self.pending_delay = (d != self.delay_frames || self.delay_xfade.is_some()).then_some(d);
+        self.eq.update(&s.eq);
     }
 
     fn route(source: ChannelSource, f: [f32; 2]) -> [f32; 2] {
@@ -264,20 +358,28 @@ impl SpeakerDsp {
         }
     }
 
-    /// Process one packet of stereo float frames into big-endian s16 bytes.
+    /// Process one packet of stereo float frames into big-endian s16 bytes (the packet
+    /// following the previous one on the timeline).
     pub fn process_to_be16(&mut self, input: &[[f32; 2]], global_gain: f32, out: &mut Vec<u8>) {
+        self.process_at(self.next_frame, input, global_gain, out);
+    }
+
+    /// Process the packet whose first frame is timeline frame `frame0`.
+    pub fn process_at(&mut self, frame0: u64, input: &[[f32; 2]], global_gain: f32, out: &mut Vec<u8>) {
         out.clear();
+        self.next_frame = frame0 + input.len() as u64;
         self.pick_up_live_changes();
-        let overlay = match self.live.clone() {
+        let (overlay, probe) = match self.live.clone() {
             Some(live) => {
                 self.overlay.resize(input.len(), [0.0; 2]);
-                live.fill_overlay(&mut self.overlay)
+                self.probe.resize(input.len(), 0.0);
+                (live.fill_overlay(&mut self.overlay), live.fill_probes(frame0, &mut self.probe))
             }
-            None => false,
+            None => (false, false),
         };
-        let start = self.last_global.unwrap_or(global_gain);
         let n = input.len().max(1) as f32;
-        let (gain0, gain1) = (self.gain, self.target_gain);
+        // delay line + routing
+        self.routed.clear();
         for (i, &frame) in input.iter().enumerate() {
             let t = (i + 1) as f32 / n;
             // delay line (sample accurate)
@@ -302,12 +404,21 @@ impl SpeakerDsp {
                 let p = Self::route(prev, delayed);
                 r = [p[0] + (r[0] - p[0]) * t, p[1] + (r[1] - p[1]) * t];
             }
-            // EQ STAGE: per-speaker biquads would run on `r` here.
+            self.routed.push([r[0] as f64, r[1] as f64]);
+        }
+        // EQ stage
+        self.eq.process(&mut self.routed);
+        // gains, test chime, calibration probe
+        let start = self.last_global.unwrap_or(global_gain);
+        let (gain0, gain1) = (self.gain, self.target_gain);
+        for (i, r) in self.routed.iter().enumerate() {
+            let t = (i + 1) as f32 / n;
             let trim = gain0 + (gain1 - gain0) * t;
             let g = (start + (global_gain - start) * t) * trim;
             let extra = if overlay { self.overlay[i] } else { [0.0; 2] };
-            for (s, x) in r.into_iter().zip(extra) {
-                out.extend_from_slice(&f32_to_i16(s * g + x * trim).to_be_bytes());
+            let p = if probe { self.probe[i] } else { 0.0 };
+            for (s, x) in [r[0] as f32, r[1] as f32].into_iter().zip(extra) {
+                out.extend_from_slice(&f32_to_i16(s * g + x * trim + p).to_be_bytes());
             }
         }
         self.gain = gain1;
@@ -508,7 +619,7 @@ mod tests {
 
     #[test]
     fn overlay_plays_on_this_speaker_then_ends() {
-        let live = LiveDsp::new(DspSettings { source: ChannelSource::Left, gain_db: 0.0, delay_ms: 0.0 });
+        let live = LiveDsp::new(DspSettings { source: ChannelSource::Left, ..Default::default() });
         let mut dsp = SpeakerDsp::with_live(live.clone(), 44100);
         let silence = vec![[0.0f32; 2]; 352];
         live.play_overlay(Box::new(crate::audio::tone::ToneSource::new(0.5, 0.15)));

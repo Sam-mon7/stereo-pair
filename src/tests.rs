@@ -425,8 +425,7 @@ fn two_fake_receivers_share_one_timeline() {
             });
             let mut p = SpeakerPlan::new(&format!("fake{i}"), IpAddr::V4(Ipv4Addr::LOCALHOST), creds, DspSettings {
                 source: role,
-                gain_db: 0.0,
-                delay_ms: 0.0,
+                ..Default::default()
             });
             p.port = r.port;
             p
@@ -439,6 +438,7 @@ fn two_fake_receivers_share_one_timeline() {
         reconnect: false,
         run_for: Some(Duration::from_millis(1500)),
         gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        spatial: Default::default(),
     };
     // stereo source: left = tone, right = silence -> only the "left" speaker hears it
     let source = Box::new(ToneSource::new(0.5, 0.5).split(true));

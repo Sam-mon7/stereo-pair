@@ -4,7 +4,13 @@
 //! [`Engine`] is one running stream (one timeline). It is driven by calling
 //! [`Engine::tick`] every ~100 ms: the CLI does that in [`run`], the tray app's
 //! controller from its supervisor thread. Speakers can be added and removed while it
-//! runs; per-speaker DSP changes need no engine call at all (see [`crate::dsp::LiveDsp`]).
+//! runs; per-speaker DSP changes need no engine call at all (see [`crate::dsp::LiveDsp`]),
+//! nor do the pair-wide spatial settings ([`crate::dsp::spatial::LiveSpatial`]).
+//!
+//! The sender loop per packet: `source.fill` -> spatial stage (once, on the shared
+//! stereo input) -> for each speaker: its own DSP (routing, EQ, gains, delay, probes)
+//! -> encrypt -> send. [`Engine::set_programme_mute`] ramps the programme (not the
+//! calibration probes or the test chime) to silence, used while calibrating.
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -17,6 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::airplay::session::{AIRPLAY_PORT, SpeakerSession};
 use crate::audio::Source;
+use crate::dsp::spatial::{LiveSpatial, SpatialStage};
 use crate::dsp::{DspSettings, LiveDsp, SpeakerDsp};
 use crate::hap::Credentials;
 use crate::raop::packets::FRAMES_PER_PACKET;
@@ -65,6 +72,8 @@ pub struct EngineOptions {
     pub run_for: Option<Duration>,
     /// Linear global gain as f32 bits (Windows master volume follower).
     pub gain: Arc<AtomicU32>,
+    /// Pair-wide spatial settings (live).
+    pub spatial: Arc<LiveSpatial>,
 }
 
 pub type SlotId = u64;
@@ -144,6 +153,7 @@ pub struct Engine {
     next_id: SlotId,
     sender: Option<JoinHandle<()>>,
     sender_stop: Arc<AtomicBool>,
+    programme_mute: Arc<AtomicBool>,
     reconnect: bool,
     device_volume_db: Option<f32>,
     last_check: Instant,
@@ -215,7 +225,14 @@ impl Engine {
 
         timeline.start_at(clock().now());
         let sender_stop = Arc::new(AtomicBool::new(false));
-        let sender = spawn_sender(source, sinks.clone(), timeline.clone(), opts.gain.clone(), sender_stop.clone())?;
+        let programme_mute = Arc::new(AtomicBool::new(false));
+        let sender = spawn_sender(
+            source,
+            sinks.clone(),
+            timeline.clone(),
+            Gains { global: opts.gain.clone(), mute: programme_mute.clone(), spatial: opts.spatial.clone() },
+            sender_stop.clone(),
+        )?;
         info!("streaming");
         let ids = slots.iter().map(|s| s.id).collect();
         let next_id = slots.len() as SlotId;
@@ -228,6 +245,7 @@ impl Engine {
                 next_id,
                 sender: Some(sender),
                 sender_stop,
+                programme_mute,
                 reconnect: opts.reconnect,
                 device_volume_db: opts.device_volume_db,
                 last_check: Instant::now(),
@@ -347,6 +365,17 @@ impl Engine {
         self.timeline.latency
     }
 
+    /// The shared timeline (to schedule calibration probes on it).
+    pub fn timeline(&self) -> Arc<Timeline> {
+        self.timeline.clone()
+    }
+
+    /// Ramp the programme audio to silence (true) or back (false) on every speaker,
+    /// from the next packet; probes and the test chime are not affected.
+    pub fn set_programme_mute(&self, mute: bool) {
+        self.programme_mute.store(mute, Ordering::Relaxed);
+    }
+
     pub fn status(&self) -> Vec<SlotStatus> {
         let now = Instant::now();
         self.slots
@@ -410,14 +439,15 @@ pub fn run(plans: Vec<SpeakerPlan>, source: Box<dyn Source>, opts: EngineOptions
     Ok(())
 }
 
-fn spawn_sender(
-    mut source: Box<dyn Source>,
-    sinks: Sinks,
-    timeline: Arc<Timeline>,
-    gain: Arc<AtomicU32>,
-    stop: Arc<AtomicBool>,
-) -> Result<JoinHandle<()>> {
+struct Gains {
+    global: Arc<AtomicU32>,
+    mute: Arc<AtomicBool>,
+    spatial: Arc<LiveSpatial>,
+}
+
+fn spawn_sender(mut source: Box<dyn Source>, sinks: Sinks, timeline: Arc<Timeline>, gains: Gains, stop: Arc<AtomicBool>) -> Result<JoinHandle<()>> {
     Ok(std::thread::Builder::new().name("rtp-sender".into()).spawn(move || {
+        let mut spatial = SpatialStage::with_live(gains.spatial, timeline.sample_rate);
         // 1 ms timer resolution so sleeps between 8 ms packets are accurate.
         unsafe { windows::Win32::Media::timeBeginPeriod(1) };
         let clk = clock();
@@ -432,10 +462,10 @@ fn spawn_sender(
             }
             while n < due {
                 source.fill(&mut frames);
-                // PAIR STAGE (extension point): spatial effects across the pair
-                // (crossfeed / widening) would process `frames` here, once, before
-                // each speaker's own routing + DSP.
-                let g = f32::from_bits(gain.load(Ordering::Relaxed));
+                // pair stage: once, on the shared stereo input
+                spatial.process(&mut frames);
+                // each speaker ramps its global gain per packet, so muting is click-free
+                let g = if gains.mute.load(Ordering::Relaxed) { 0.0 } else { f32::from_bits(gains.global.load(Ordering::Relaxed)) };
                 {
                     let mut sinks = sinks.lock().unwrap();
                     for (_, sink) in sinks.iter_mut() {

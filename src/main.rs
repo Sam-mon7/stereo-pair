@@ -312,6 +312,7 @@ fn cmd_tone(ips: Vec<IpAddr>, seconds: f64, amplitude: f32, latency_ms: Option<u
         reconnect: false,
         run_for: Some(Duration::from_secs_f64(seconds + latency as f64 / 44100.0 + 0.75)),
         gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        spatial: Default::default(),
     };
     let stop = ctrl_c_flag()?;
     engine::run(plans, source, opts, stop)
@@ -393,6 +394,7 @@ fn cmd_run(latency_ms: Option<u32>) -> Result<()> {
         reconnect: true,
         run_for: None,
         gain,
+        spatial: dsp::spatial::LiveSpatial::new(cfg.spatial.clone()),
     };
     let stop = ctrl_c_flag()?;
     let res = engine::run(plans, source, opts, stop);

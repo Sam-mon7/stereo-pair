@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::dsp::eq::EqSettings;
+use crate::dsp::spatial::SpatialSettings;
 use crate::dsp::{ChannelSource, DspSettings};
 use crate::hap::{Credentials, HapCredentials};
 
@@ -59,6 +61,13 @@ pub struct Config {
     /// Tray app: start streaming as soon as it launches.
     #[serde(default = "default_true")]
     pub auto_start: bool,
+    /// Pair-wide spatial effects (width, balance, bass mono, crosstalk cancellation).
+    #[serde(default, skip_serializing_if = "SpatialSettings::is_default")]
+    pub spatial: SpatialSettings,
+    /// Capture device of the calibration mic (substring of its name); unset = the
+    /// first input named "Analogue 1 + 2", else the default input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_mic: Option<String>,
     #[serde(default, rename = "speaker")]
     pub speakers: Vec<SpeakerConfig>,
 }
@@ -82,15 +91,27 @@ pub struct SpeakerConfig {
     pub delay_ms: f32,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Parametric EQ (biquad chain) for this speaker.
+    #[serde(default, skip_serializing_if = "EqSettings::is_default")]
+    pub eq: EqSettings,
 }
 
 impl SpeakerConfig {
     pub fn new(name: &str, ip: &str, role: ChannelSource) -> Self {
-        Self { name: name.into(), ip: Some(ip.into()), port: None, role, gain_db: 0.0, delay_ms: 0.0, enabled: true }
+        Self {
+            name: name.into(),
+            ip: Some(ip.into()),
+            port: None,
+            role,
+            gain_db: 0.0,
+            delay_ms: 0.0,
+            enabled: true,
+            eq: EqSettings::default(),
+        }
     }
 
     pub fn dsp(&self) -> DspSettings {
-        DspSettings { source: self.role, gain_db: self.gain_db, delay_ms: self.delay_ms }
+        DspSettings { source: self.role, gain_db: self.gain_db, delay_ms: self.delay_ms, eq: self.eq.clone() }
     }
 
     /// Stable identity of the endpoint ("ip:port", or "mdns:<name>" without an ip).
@@ -120,6 +141,8 @@ impl Default for Config {
             timing_port: 0,
             client_name: default_client_name(),
             auto_start: true,
+            spatial: SpatialSettings::default(),
+            calibration_mic: None,
             speakers: vec![
                 SpeakerConfig::new("Living Room", "192.168.1.50", ChannelSource::Left),
                 SpeakerConfig::new("Living Room (2)", "192.168.1.51", ChannelSource::Right),
@@ -135,6 +158,9 @@ const CONFIG_HEADER: &str = "\
 # follow_windows_volume apply Windows master volume + mute as digital gain
 # auto_start            tray app: start streaming on launch
 # [[speaker]]           role = left | right | mono | stereo, gain_db, delay_ms (0..500)
+# [speaker.eq]          bypass; [[speaker.eq.band]] type = peaking | low_shelf | high_shelf |
+#                       high_pass | low_pass, freq_hz, gain_db, q, enabled, source = calibration
+# [spatial]             width / balance / bass mono / crosstalk cancellation (pair-wide)
 ";
 
 impl Config {
@@ -358,6 +384,27 @@ mod tests {
         let saved = toml::to_string_pretty(&cfg).unwrap();
         assert!(!saved.contains("\nport"), "unset port is not written: {saved}");
         assert!(saved.contains("auto_start = true"));
+    }
+
+    #[test]
+    fn eq_and_spatial_round_trip_and_stay_out_of_plain_configs() {
+        use crate::dsp::biquad::FilterKind;
+        use crate::dsp::eq::{BandSource, EqBand};
+        let plain = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!plain.contains("eq") && !plain.contains("spatial") && !plain.contains("calibration"), "{plain}");
+        let mut cfg = Config::default();
+        cfg.spatial.width_enabled = true;
+        cfg.spatial.width_pct = 140.0;
+        cfg.spatial.xtc_enabled = true;
+        cfg.calibration_mic = Some("Analogue 1 + 2".into());
+        cfg.speakers[0].eq.bands.push(EqBand { kind: FilterKind::HighPass, freq_hz: 45.0, ..Default::default() });
+        cfg.speakers[0].eq.bands.push(EqBand { source: BandSource::Calibration, ..EqBand::peaking(320.0, -4.5, 3.2) });
+        cfg.speakers[1].eq.bypass = true;
+        let text = format!("{CONFIG_HEADER}\n{}", toml::to_string_pretty(&cfg).unwrap());
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, cfg, "{text}");
+        assert!(text.contains("[[speaker.eq.band]]"), "{text}");
+        assert_eq!(back.speakers[0].dsp().eq.bands.len(), 2);
     }
 
     #[test]

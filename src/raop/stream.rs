@@ -142,7 +142,7 @@ impl StreamSink {
 
     /// Run this speaker's DSP over the shared input frames and send packet `packet`.
     pub fn send_audio(&mut self, timeline: &Timeline, packet: u64, input: &[[f32; 2]], global_gain: f32) {
-        self.dsp.process_to_be16(input, global_gain, &mut self.pcm);
+        self.dsp.process_at(Timeline::frames_before(packet), input, global_gain, &mut self.pcm);
         let header = audio_header(self.first_audio, self.seq, timeline.rtptime(packet), self.ssrc);
         self.first_audio = false;
         build_audio_packet(&mut self.cipher, &header, &self.pcm, &mut self.packet);

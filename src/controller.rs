@@ -36,6 +36,7 @@ use crate::audio::volume::VolumeFollower;
 use crate::audio::{InputHandle, Source};
 use crate::config::{Config, CredentialStore, SpeakerConfig};
 use crate::dsp::LiveDsp;
+use crate::dsp::spatial::LiveSpatial;
 use crate::engine::{self, Engine, EngineOptions, RETRY_AFTER, SlotId, SlotState, SpeakerPlan};
 use crate::hap::Credentials;
 
@@ -201,6 +202,8 @@ struct Shared {
     status: Mutex<Status>,
     config: Mutex<Config>,
     live: Mutex<HashMap<String, Arc<LiveDsp>>>,
+    /// Pair-wide spatial settings, kept across engine restarts.
+    spatial: Arc<LiveSpatial>,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -226,6 +229,7 @@ impl Controller {
             status: Mutex::new(Status::default()),
             config: Mutex::new(cfg.clone()),
             live: Mutex::new(HashMap::new()),
+            spatial: LiveSpatial::new(cfg.spatial.clone()),
             waker: Mutex::new(None),
         });
         for s in &cfg.speakers {
@@ -276,6 +280,7 @@ impl Controller {
         for s in &cfg.speakers {
             self.shared.live_for(s);
         }
+        self.shared.spatial.set(cfg.spatial.clone());
         *self.shared.config.lock().unwrap() = cfg.clone();
         let _ = self.tx.send(Cmd::Update(Box::new(cfg)));
     }
@@ -476,6 +481,7 @@ impl Supervisor {
             reconnect: true,
             run_for: None,
             gain: self.gain.clone(),
+            spatial: self.shared.spatial.clone(),
         };
         match Engine::start(plans, source, opts) {
             Ok((engine, ids)) => {
@@ -506,6 +512,7 @@ impl Supervisor {
         for s in &cfg.speakers {
             self.shared.live_for(s);
         }
+        self.shared.spatial.set(cfg.spatial.clone());
         if let Some(v) = &self.deps.volume {
             v.set_follow(cfg.follow_windows_volume);
         }
@@ -588,6 +595,7 @@ impl Supervisor {
             reconnect: false,
             run_for: Some(Duration::from_secs_f64(TEST_SECONDS + latency as f64 / 44100.0 + 0.75)),
             gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            spatial: Default::default(),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
