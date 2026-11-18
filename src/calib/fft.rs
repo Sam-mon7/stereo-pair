@@ -13,6 +13,7 @@ pub struct C {
 impl C {
     pub const ZERO: C = C { re: 0.0, im: 0.0 };
 
+    #[cfg(test)]
     pub fn new(re: f64, im: f64) -> Self {
         Self { re, im }
     }

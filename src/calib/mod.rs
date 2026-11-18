@@ -40,8 +40,7 @@ pub const GRID_LO: f64 = 20.0;
 pub const GRID_HI: f64 = 20000.0;
 pub const GRID_PER_OCTAVE: f64 = 24.0;
 
-pub use analysis::{Analysis, Recording, analyze};
-pub use fit::{Proposal, propose};
+pub use analysis::Recording;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SweepSpec {

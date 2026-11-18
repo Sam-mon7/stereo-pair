@@ -196,6 +196,7 @@ impl LiveDsp {
     }
 
     /// True while probes are scheduled or playing.
+    #[cfg_attr(not(test), allow(dead_code))] // inspection (tests)
     pub fn probes_pending(&self) -> bool {
         self.probes_active.load(Ordering::Acquire)
     }
@@ -360,6 +361,7 @@ impl SpeakerDsp {
 
     /// Process one packet of stereo float frames into big-endian s16 bytes (the packet
     /// following the previous one on the timeline).
+    #[cfg(test)]
     pub fn process_to_be16(&mut self, input: &[[f32; 2]], global_gain: f32, out: &mut Vec<u8>) {
         self.process_at(self.next_frame, input, global_gain, out);
     }

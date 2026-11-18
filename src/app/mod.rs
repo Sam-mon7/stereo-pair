@@ -7,8 +7,11 @@
 //! app stays in the tray). The engine, volume follower, capture and pairing run on
 //! their own threads.
 
+mod calib_ui;
+mod eq_ui;
 mod panel;
 mod pairing;
+mod plot;
 mod tray;
 mod win;
 
@@ -23,6 +26,7 @@ use tracing::{error, info, warn};
 use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
+use crate::calib::job::CalibrationResult;
 use crate::config::{self, Config};
 use crate::controller::{Controller, ControllerDeps};
 use pairing::PairFlow;
@@ -61,6 +65,8 @@ pub struct TrayApp {
     pub pair: PairFlow,
     pub autostart: bool,
     pub log_dir: PathBuf,
+    /// Last applied calibration (for the EQ plots), while the app runs.
+    pub last_calibration: Option<Arc<CalibrationResult>>,
 }
 
 impl TrayApp {
@@ -235,6 +241,7 @@ fn run_tray(opts: TrayOptions) -> Result<()> {
         pair,
         autostart,
         log_dir: log_dir()?,
+        last_calibration: None,
     };
     loop {
         app.poll();

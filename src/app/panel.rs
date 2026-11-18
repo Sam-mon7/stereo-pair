@@ -1,6 +1,10 @@
 //! The control panel window (egui). Opened on demand from the tray; closing it
 //! returns to the tray loop. Edits go straight to the controller (DSP changes are
 //! live) and are persisted by it after a short debounce.
+//!
+//! Sections: header (start/stop, latency, volume, input, Calibrate...), one card per
+//! speaker (role, gain, delay, EQ expander with response plot), Spatial, footer.
+//! The calibration wizard lives in [`super::calib_ui`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,8 +12,11 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use eframe::egui::{self, Color32, RichText, Ui, ViewportCommand};
 
+use super::calib_ui::{CalibUi, Env};
+use super::eq_ui::{self, Measured};
 use super::pairing::Phase;
 use super::{TrayApp, tray, win};
+use crate::calib::job::{CalibrationResult, CalibrationState};
 use crate::config::{Config, SpeakerConfig};
 use crate::controller::{EngineState, Health, SpeakerState, SpeakerStatus, Status};
 use crate::dsp::{ChannelSource, MAX_DELAY_MS};
@@ -22,7 +29,7 @@ pub fn show(app: &mut TrayApp) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Stereo Pair")
-            .with_inner_size([600.0, 720.0])
+            .with_inner_size([640.0, 780.0])
             .with_min_inner_size([480.0, 420.0])
             .with_icon(Arc::new(icon)),
         centered: true,
@@ -56,6 +63,7 @@ struct Panel<'a> {
     pin: String,
     remove_confirm: Option<String>,
     autostart_error: Option<String>,
+    calib: CalibUi,
 }
 
 impl<'a> Panel<'a> {
@@ -76,6 +84,7 @@ impl<'a> Panel<'a> {
             pin: String::new(),
             remove_confirm: None,
             autostart_error: None,
+            calib: CalibUi::default(),
         }
     }
 
@@ -148,10 +157,14 @@ impl eframe::App for Panel<'_> {
                 ui.separator();
                 ui.add_space(4.0);
                 self.speakers(ui, &st);
+                ui.add_space(2.0);
+                eq_ui::spatial_editor(ui, &mut self.cfg.spatial);
             });
         });
         let ctx = ui.ctx().clone();
         self.pair_window(&ctx);
+        let env = Env { controller: &self.app.controller, cfg: &mut self.cfg, status: &st, last: &mut self.app.last_calibration };
+        self.calib.window(&ctx, env);
         self.push_changes();
     }
 }
@@ -165,6 +178,16 @@ impl Panel<'_> {
                 let text = if st.wanted { "Stop" } else { "Start" };
                 if ui.add(egui::Button::new(RichText::new(text).strong()).min_size(egui::vec2(72.0, 26.0))).clicked() {
                     self.app.toggle_streaming();
+                }
+                let busy = self.app.controller.calibration().busy();
+                let label = if busy { "Calibrating..." } else { "Calibrate..." };
+                if ui
+                    .add(egui::Button::new(label).min_size(egui::vec2(96.0, 26.0)))
+                    .on_hover_text("Measure the speakers with a mic at your seat and match their timing, level and tone")
+                    .clicked()
+                {
+                    let hint = self.cfg.calibration_mic.clone();
+                    self.calib.show(hint.as_deref());
                 }
             });
         });
@@ -220,15 +243,25 @@ impl Panel<'_> {
         }
         let mut remove: Option<usize> = None;
         let speakers_len = self.cfg.speakers.len();
+        // measured responses for the EQ plots: a result on screen, else the last applied
+        let cal: Option<Arc<CalibrationResult>> = match self.app.controller.calibration() {
+            CalibrationState::Done(r) => Some(r),
+            _ => self.app.last_calibration.clone(),
+        };
         for i in 0..speakers_len {
             let key = self.cfg.speakers[i].key();
             let status = st.speakers.iter().find(|s| s.key == key).cloned();
             let controller = &self.app.controller;
             let confirm = &mut self.remove_confirm;
             let s = &mut self.cfg.speakers[i];
+            let measured = cal.as_ref().and_then(|r| {
+                let j = r.keys.iter().position(|k| *k == key)?;
+                Some(Measured { freqs: &r.analysis.grid_hz, normalized: &r.proposal.speakers[j].normalized_db, target: &r.proposal.target_db })
+            });
             egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 speaker_card(ui, s, status.as_ref(), controller, confirm, &mut remove, i);
+                eq_ui::eq_editor(ui, i, &mut s.eq, measured);
             });
             ui.add_space(6.0);
         }

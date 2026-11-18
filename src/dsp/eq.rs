@@ -98,6 +98,7 @@ impl EqSettings {
     }
 
     /// Magnitude response of the chain at `freq` (0 dB when bypassed).
+    #[cfg(test)]
     pub fn response_db(&self, freq: f64, sample_rate: f64) -> f64 {
         self.active().map(|b| b.coeffs(sample_rate).magnitude_db(freq, sample_rate)).sum()
     }

@@ -103,6 +103,7 @@ pub struct CalibrationResult {
     pub analysis: Analysis,
     pub proposal: Proposal,
     /// Timeline frame of the first sweep.
+    #[cfg_attr(not(test), allow(dead_code))] // inspection (tests)
     pub first_frame: u64,
 }
 
@@ -132,6 +133,8 @@ pub enum CalibrationState {
     Measuring {
         progress: f32,
         detail: String,
+        /// Timeline frame of the first sweep.
+        #[cfg_attr(not(test), allow(dead_code))] // inspection (tests)
         first_frame: u64,
     },
     Analyzing,
@@ -212,10 +215,6 @@ impl Job {
         };
         let state = job.measuring_state(begin_frame);
         Ok((job, state))
-    }
-
-    pub fn first_frame(&self) -> u64 {
-        self.first_frame
     }
 
     pub fn measuring(&self) -> bool {

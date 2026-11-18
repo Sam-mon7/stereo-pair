@@ -67,7 +67,6 @@ struct State {
 }
 
 pub struct Mic {
-    device: String,
     state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -174,7 +173,7 @@ impl Mic {
             drop(stream);
         })?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => Ok(Mic { device: name.to_string(), state, stop, thread: Some(thread) }),
+            Ok(Ok(())) => Ok(Mic { state, stop, thread: Some(thread) }),
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 stop.store(true, Ordering::Relaxed);
@@ -183,17 +182,9 @@ impl Mic {
         }
     }
 
-    pub fn device(&self) -> &str {
-        &self.device
-    }
-
     /// e.g. `2 ch, 48000 Hz, F32`
     pub fn format(&self) -> String {
         self.state.lock().unwrap().format.clone()
-    }
-
-    pub fn rate(&self) -> u32 {
-        self.state.lock().unwrap().rate
     }
 
     /// The stream's error, if it failed.
@@ -219,16 +210,6 @@ impl Mic {
         s.max_frames = (MAX_RECORD_SECONDS * s.rate.max(8000) as f64) as usize;
         s.recording = Some([Vec::new(), Vec::new()]);
         s.overflowed = false;
-    }
-
-    pub fn is_recording(&self) -> bool {
-        self.state.lock().unwrap().recording.is_some()
-    }
-
-    /// Seconds recorded so far.
-    pub fn recorded_seconds(&self) -> f64 {
-        let s = self.state.lock().unwrap();
-        s.recording.as_ref().map(|r| r[0].len() as f64 / s.rate.max(1) as f64).unwrap_or(0.0)
     }
 
     /// Stop recording and hand over what was captured (channel 1 and 2).
