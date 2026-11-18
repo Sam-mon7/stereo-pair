@@ -235,7 +235,7 @@ impl CalibUi {
             ui.end_row();
             ui.label("");
             match (&self.mic, &self.mic_error) {
-                (_, Some(e)) => ui.colored_label(BAD, e),
+                (_, Some(e)) => ui.add(egui::Label::new(RichText::new(e).color(BAD)).wrap()),
                 (Some(m), None) => ui.weak(format!("{}; the louder input is used", m.format())),
                 _ => ui.weak(""),
             };
@@ -256,26 +256,24 @@ impl CalibUi {
             ui.label("Sweep level");
             ui.add(egui::Slider::new(&mut self.level_dbfs, -40.0..=-6.0).suffix(" dBFS").step_by(1.0));
             ui.end_row();
-            ui.label("");
-            let diff = self.level_dbfs - music_db;
-            if diff > 3.0 {
-                ui.colored_label(
-                    WARN,
-                    format!(
-                        "About {diff:.0} dB louder than the loudest music at your current volume ({music_db:.0} dB). The sweeps ignore the Windows volume; consider a lower level."
-                    ),
-                );
-            } else {
-                ui.weak(format!(
-                    "About {:.0} dB below the loudest music at your current volume. The sweeps ignore the Windows volume.",
-                    -diff
-                ));
-            }
-            ui.end_row();
             ui.label("Sweeps");
             ui.add(egui::Slider::new(&mut self.repeats, 1..=4).suffix(" per speaker"));
             ui.end_row();
         });
+        let diff = self.level_dbfs - music_db;
+        let text = if diff > 3.0 {
+            RichText::new(format!(
+                "The sweeps will peak about {diff:.0} dB above the loudest music at your current Windows volume (they ignore it). Consider a lower level."
+            ))
+            .color(WARN)
+        } else {
+            RichText::new(format!(
+                "The sweeps will peak about {:.0} dB below the loudest music at your current Windows volume (they ignore it).",
+                -diff
+            ))
+            .weak()
+        };
+        plot::small_label(ui, text);
 
         // readiness
         let enabled: Vec<_> = st.speakers.iter().filter(|s| s.enabled).collect();
@@ -368,13 +366,13 @@ impl CalibUi {
             ui.end_row();
             ui.label("Arrival");
             for s in &a.speakers {
-                ui.label(format!("{:+.2} ms (+-{:.2})", s.arrival_ms, s.arrival_spread_ms / 2.0));
+                ui.label(format!("{:+.2} ms (±{:.2})", s.arrival_ms, s.arrival_spread_ms / 2.0));
             }
             ui.end_row();
             ui.label("Level at mic");
             let ref_level = a.speakers[0].level_db;
             for s in &a.speakers {
-                ui.label(format!("{:+.1} dB (+-{:.1})", s.level_db - ref_level, s.level_spread_db / 2.0));
+                ui.label(format!("{:+.1} dB (±{:.1})", s.level_db - ref_level, s.level_spread_db / 2.0));
             }
             ui.end_row();
             ui.label("Signal / noise");

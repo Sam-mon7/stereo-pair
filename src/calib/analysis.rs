@@ -31,6 +31,8 @@ pub const IR_POST_SEC: f64 = 0.5;
 const DIRECT_PRE_SEC: f64 = 0.005;
 const DIRECT_POST_SEC: f64 = 0.010;
 const GCC_UPSAMPLE: usize = 32;
+/// Deconvolution band edges: flat from f1 * BAND_EDGE to f2 / BAND_EDGE.
+const BAND_EDGE: f64 = 1.12;
 /// How far a speaker's IR may sit from where the schedule predicts it.
 const SEARCH_SEC: f64 = 0.25;
 
@@ -66,7 +68,8 @@ pub struct SpeakerResult {
     pub snr_db: Option<f64>,
     /// RMS level of this speaker's sweeps at the mic (dBFS).
     pub sweep_dbfs: f64,
-    /// 1/6-octave smoothed response on [`Analysis::grid_hz`] (dB path gain).
+    /// 1/6-octave smoothed response on [`Analysis::grid_hz`] (dB path gain; NaN
+    /// outside the measured band, 25 Hz..17.4 kHz for the default sweep).
     pub response_db: Vec<f64>,
     /// Median over 100 Hz..10 kHz of the per-frequency spread between repeats (dB).
     pub response_spread_db: f64,
@@ -188,7 +191,7 @@ fn deconvolve(xs: &[C], sweep: &SweepSpec, fs: f64, ratio: f64) -> Vec<f64> {
         .zip(&s)
         .enumerate()
         .map(|(k, (x, sk))| {
-            let w = band_weight(bin_freq(k, n, fs), sweep.f1, hi, 1.4);
+            let w = band_weight(bin_freq(k, n, fs), sweep.f1, hi, BAND_EDGE);
             if w == 0.0 { C::ZERO } else { (*x * sk.conj()).scale(w / (sk.norm_sqr() + eps)) }
         })
         .collect();
@@ -346,11 +349,17 @@ fn ir_power(seg: &[f64], pre: usize, fs: f64) -> (Vec<f64>, f64) {
     (spec[..=n / 2].iter().map(|c| c.norm_sqr()).collect(), fs / n as f64)
 }
 
-fn lf_rolloff(grid: &[f64], resp3: &[f64], level: f64) -> f64 {
+/// -6 dB point below 200 Hz of the 1/2-octave-smoothed response, relative to the
+/// median of the 1/3-octave response over 200 Hz..2 kHz (both robust to resonances
+/// and reflection dips).
+fn lf_rolloff(grid: &[f64], resp3: &[f64], resp_half: &[f64]) -> f64 {
+    let mut mid: Vec<f64> = grid.iter().zip(resp3).filter(|(f, _)| (200.0..=2000.0).contains(*f)).map(|(_, v)| *v).collect();
+    mid.sort_by(f64::total_cmp);
+    let reference = mid.get(mid.len() / 2).cloned().unwrap_or(0.0);
     let start = grid.iter().rposition(|&f| f <= LEVEL_BAND.0).unwrap_or(0);
     let mut lo = grid[start];
     for i in (0..=start).rev() {
-        if resp3[i] < level - 6.0 {
+        if resp_half[i].is_nan() || resp_half[i] < reference - 6.0 {
             break;
         }
         lo = grid[i];
@@ -484,9 +493,18 @@ pub fn analyze(rec: &Recording, sched: &Schedule, names: &[String]) -> Result<An
         }
         let (mut power, bin) = power_sum.unwrap();
         power.iter_mut().for_each(|v| *v /= ks.len() as f64);
-        let response_db = smooth_db(&power, bin, &grid, 6.0);
+        let mut response_db = smooth_db(&power, bin, &grid, 6.0);
         let resp3 = smooth_db(&power, bin, &grid, 3.0);
+        let resp_half = smooth_db(&power, bin, &grid, 2.0);
         let level_db = band_level_db(&grid, &response_db, LEVEL_BAND);
+        let lf_rolloff_hz = lf_rolloff(&grid, &resp3, &resp_half);
+        // outside the sweep's flat band the response is not measured: leave it blank
+        let (valid_lo, valid_hi) = (sweep.f1 * 1.25, sweep.f2.min(0.47 * fs) / 1.15);
+        for (v, f) in response_db.iter_mut().zip(&grid) {
+            if *f < valid_lo || *f > valid_hi {
+                *v = f64::NAN;
+            }
+        }
         let mut spreads: Vec<f64> = grid
             .iter()
             .enumerate()
@@ -507,7 +525,7 @@ pub fn analyze(rec: &Recording, sched: &Schedule, names: &[String]) -> Result<An
             snr_db: noise_rms.map(|nr| db(srms / nr.max(1e-12))),
             sweep_dbfs: db(srms),
             response_spread_db: spreads.get(spreads.len() / 2).cloned().unwrap_or(0.0),
-            lf_rolloff_hz: lf_rolloff(&grid, &resp3, level_db),
+            lf_rolloff_hz,
             response_db,
             irs: ks.iter().map(|&k| segs[k].iter().map(|&v| v as f32).collect()).collect(),
         });

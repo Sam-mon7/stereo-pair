@@ -14,8 +14,9 @@
 //!   cancellations that boosting cannot fix: only dips at least 1/3 octave wide, by
 //!   half their depth, and only above 2 x the roll-off), only between 1.25 x the
 //!   speaker's own low-frequency roll-off and [`FIT_HI_HZ`]. Errors under 1 dB are
-//!   left alone. The target is fitted from 2 x the highest roll-off to 12 kHz and held
-//!   flat outside that band.
+//!   left alone, and above [`NARROW_BELOW_HZ`] only broad bands (Q <= 2.5) are used.
+//!   The target is fitted from 2 x the highest roll-off to 12 kHz and held flat
+//!   outside that band.
 
 use serde::Serialize;
 
@@ -32,7 +33,14 @@ pub const FIT_LO_MIN_HZ: f64 = 40.0;
 pub const BOOST_ABOVE_ROLLOFF: f64 = 2.0;
 /// Dips narrower than this (octaves at half depth) are not boosted at all.
 pub const MIN_BOOST_WIDTH_OCT: f64 = 1.0 / 3.0;
-const MIN_ERROR_DB: f64 = 1.0;
+const MIN_ERROR_DB: f64 = 1.5;
+/// Above this, only broad bands (the in-room response there depends on the exact
+/// mic position; narrow corrections would chase reflections).
+pub const NARROW_BELOW_HZ: f64 = 500.0;
+
+fn max_q(f: f64) -> f64 {
+    if f < NARROW_BELOW_HZ { 8.0 } else { 2.5 }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SpeakerProposal {
@@ -160,9 +168,11 @@ fn fit_bands(grid: &[f64], err: &[f64], lo: f64, boost_lo: f64, hi: f64) -> Vec<
                 for fo in [-1.0 / 24.0, 0.0, 1.0 / 24.0] {
                     let f = (grid[i0] * 2f64.powf(fo)).clamp(f_lo, hi);
                     let g = (g0 * gm).clamp(-MAX_CUT_DB, MAX_BOOST_DB);
+                    // boosts stay local (no broad bass lifts towards the roll-off)
+                    let q_min = if boost { 1.0 } else { 0.5 };
                     let b = EqBand {
                         source: BandSource::Calibration,
-                        ..EqBand::peaking(f as f32, g as f32, (q0 * qm).clamp(0.5, 8.0) as f32)
+                        ..EqBand::peaking(f as f32, g as f32, (q0 * qm).clamp(q_min, max_q(f)) as f32)
                     };
                     let bd = band_db(&b, grid);
                     let r: Vec<f64> = resid.iter().zip(&bd).map(|(a, b)| a + b).collect();
@@ -196,6 +206,9 @@ fn fit_bands(grid: &[f64], err: &[f64], lo: f64, boost_lo: f64, hi: f64) -> Vec<
     }
     for b in bands.iter_mut() {
         b.freq_hz = (b.freq_hz * 10.0).round() / 10.0;
+        if b.gain_db > 0.0 && (b.freq_hz as f64) < boost_lo {
+            b.freq_hz = ((boost_lo * 10.0).ceil() / 10.0) as f32;
+        }
         b.gain_db = (b.gain_db * 10.0).round() / 10.0;
         b.q = (b.q * 100.0).round() / 100.0;
     }

@@ -140,7 +140,7 @@ pub fn grid() -> Vec<f64> {
 
 /// Fractional-octave smoothing of a power spectrum (`power[k]` at `k * bin_hz`) onto
 /// `grid`: the mean power over `[f / 2^(1/2n), f * 2^(1/2n)]`, in dB (n = 6 for
-/// 1/6 octave).
+/// 1/6 octave, 1 for an octave).
 pub fn smooth_db(power: &[f64], bin_hz: f64, grid: &[f64], n: f64) -> Vec<f64> {
     let mut prefix = Vec::with_capacity(power.len() + 1);
     prefix.push(0.0);
