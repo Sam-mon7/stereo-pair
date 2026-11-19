@@ -12,8 +12,9 @@ use crate::dsp::{ChannelSource, DspSettings};
 use crate::hap::{Credentials, HapCredentials};
 
 pub const DEFAULT_CLIENT_NAME: &str = "Stereo Pair";
-/// X-Apple-Device-ID the spike paired the Home View with (patched pyatv hap.py).
-pub const SPIKE_APPLE_DEVICE_ID: &str = "0x569EF725E5A4";
+/// Placeholder X-Apple-Device-ID: the default for imported pyatv credentials and the
+/// fallback for stored credentials that carry none. New pairings generate their own.
+pub const SPIKE_APPLE_DEVICE_ID: &str = "0x112233445566";
 
 pub fn app_dir() -> Result<PathBuf> {
     let base = std::env::var_os("APPDATA").ok_or_else(|| anyhow!("APPDATA is not set"))?;

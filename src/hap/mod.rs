@@ -219,7 +219,7 @@ fn verify_sig(public: &[u8], msg: &[u8], sig: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Generate an `X-Apple-Device-ID` value like `0x569EF725E5A4`.
+/// Generate an `X-Apple-Device-ID` value like `0x112233445566`.
 pub fn new_apple_device_id() -> String {
     format!("0x{}", hex::encode_upper(random_bytes::<6>()))
 }
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn pairing_header_order() {
-        let h = pairing_headers(3, Some(("Stereo Pair", "0x569EF725E5A4")));
+        let h = pairing_headers(3, Some(("Stereo Pair", "0x112233445566")));
         let names: Vec<_> = h.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             names,

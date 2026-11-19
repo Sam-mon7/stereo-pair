@@ -55,3 +55,7 @@ to its timing server.
 
 The AirPlay 2 protocol handling follows the approach of
 [pyatv](https://github.com/postlund/pyatv).
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
